@@ -1,11 +1,9 @@
 import streamlit as st
 import json
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
+import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 
 
@@ -18,138 +16,381 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+@st.cache_data
+def load_reviews_json(file_path):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        return json.load(file)
+
+
+@st.cache_data
+def load_reviews_csv(file_path):
+    return pd.read_csv(file_path)
+
+
+def convert_review_date(date_str):
+    """Convert mixed date strings like 'Dined 2 days ago' and 'Dined on ...' to datetime."""
+    if 'days ago' in date_str:
+        days_ago = int(date_str.split()[1])
+        return datetime.now() - timedelta(days=days_ago)
+    if 'Dined on' in date_str:
+        return pd.to_datetime(date_str.replace('Dined on ', ''), format='%B %d, %Y')
+    return pd.to_datetime(date_str, format="%Y-%m-%d")
+
+
+def build_review_search_index(reviews_data):
+    """Build a searchable lowercase text index for reviews."""
+    return [json.dumps(review).lower() for review in reviews_data]
+
+
+def compute_yearly_rating_data(csv_file_path):
+    """Pure yearly rating calculation used for caching and background warming."""
+    df = pd.read_csv(csv_file_path)
+    review_dates = df["Date of Review"].apply(convert_review_date)
+    ratings = df["Rating"].apply(lambda x: int(x.split()[0]))
+    resampled = pd.DataFrame({'Date': review_dates, 'Rating': ratings})
+    try:
+        return resampled.resample('Y', on='Date').mean()
+    except ValueError:
+        return resampled.resample('A-DEC', on='Date').mean()
+
+
+def compute_overall_review_summary(csv_file_path, restaurant_name):
+    """Pure KPI summary calculation used for caching and background warming."""
+    df = pd.read_csv(csv_file_path)
+    avg_rating = df['Rating'].apply(lambda x: int(x.split()[0])).mean()
+    total_reviews = len(df)
+    positive_reviews = df[df['Rating'].str.contains('5 stars')].shape[0]
+    negative_reviews = df[df['Rating'].str.contains('1 star')].shape[0]
+
+    return {
+        "restaurant_name": restaurant_name,
+        "avg_rating": avg_rating,
+        "total_reviews": total_reviews,
+        "positive_reviews": positive_reviews,
+        "negative_reviews": negative_reviews
+    }
+
+
+@st.cache_data
+def get_yearly_rating_data(csv_file_path):
+    """Precompute yearly average rating series for a restaurant CSV."""
+    return compute_yearly_rating_data(csv_file_path)
+
+
+@st.cache_data
+def overall_review_summary(csv_file_path, restaurant_name):
+    """Compute top-level KPI metrics for the overall summary section."""
+    return compute_overall_review_summary(csv_file_path, restaurant_name)
+
+
+@st.cache_data
+def get_review_search_index(reviews_data):
+    """Cache the searchable review corpus for fast filtering."""
+    return build_review_search_index(reviews_data)
+
+
+def initialize_background_analysis(reviews_data):
+    """Kick off background analysis so it continues across page switches in the same session."""
+    if 'analysis_executor' not in st.session_state:
+        st.session_state.analysis_executor = ThreadPoolExecutor(max_workers=4)
+
+    if 'analysis_futures' not in st.session_state:
+        executor = st.session_state.analysis_executor
+        st.session_state.analysis_futures = {
+            'review_search_index': executor.submit(build_review_search_index, reviews_data),
+            'state_yearly': executor.submit(compute_yearly_rating_data, 'state_and_lake_chicago_tavern_reviews.csv'),
+            'second_yearly': executor.submit(compute_yearly_rating_data, 'second_restaurant_reviews.csv'),
+            'state_summary': executor.submit(compute_overall_review_summary, 'state_and_lake_chicago_tavern_reviews.csv', 'State and Lake Chicago Tavern'),
+            'second_summary': executor.submit(compute_overall_review_summary, 'second_restaurant_reviews.csv', 'Heirloom - New Haven'),
+        }
+
+
+def get_background_result(future_key, fallback_func, *args):
+    """Return completed background results when available, otherwise use the cached fallback."""
+    future = st.session_state.get('analysis_futures', {}).get(future_key)
+    if future is not None and future.done():
+        try:
+            return future.result()
+        except Exception:
+            pass
+    return fallback_func(*args)
+
+
+def get_analysis_status():
+    futures = st.session_state.get('analysis_futures', {})
+    if not futures:
+        return "ready"
+    return "ready" if all(future.done() for future in futures.values()) else "warming"
+
+
 # Load the reviews data from the JSON file
-with open('claude_response.json', 'r') as file:
-    reviews = json.load(file)
+reviews = load_reviews_json('claude_response.json')
+initialize_background_analysis(reviews)
 
 # Custom CSS for the entire app
 st.markdown(
     """
     <style>
+    @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700&family=Playfair+Display:wght@500;600;700&display=swap');
+
+    :root {
+        --bg-1: #111111;
+        --bg-2: #1a1714;
+        --ink: #f6f0e8;
+        --muted: #d0c3b2;
+        --brand: #b08a4a;
+        --brand-2: #d8bf8f;
+        --card: rgba(255, 248, 236, 0.08);
+        --line: rgba(216, 191, 143, 0.30);
+        --shadow: rgba(0, 0, 0, 0.40);
+    }
+
     .stApp {
-        background: linear-gradient(to bottom, #EA2727FF, #1a2a6c, #76142CFF);
-        color: #ecf0f1;
-        font-family: 'Garamond', serif;
+        color: var(--ink);
+        font-family: 'Manrope', sans-serif;
+        background: radial-gradient(circle at 12% 16%, rgba(176, 138, 74, 0.20) 0%, transparent 28%),
+                    radial-gradient(circle at 88% 8%, rgba(255, 223, 165, 0.15) 0%, transparent 26%),
+                    linear-gradient(140deg, var(--bg-1), #15110f 45%, var(--bg-2));
+        animation: bgShift 20s ease-in-out infinite alternate;
     }
-    .sidebar .sidebar-content {
-        background: linear-gradient(to bottom, #1a2a6c, #b21f1f, #fdbb2d);
-        color: white;
-        font-family: 'Garamond', serif;
+
+    @keyframes bgShift {
+        0% { background-position: 0% 0%, 100% 0%, 50% 50%; }
+        100% { background-position: 6% 6%, 94% 4%, 45% 55%; }
     }
-    .sidebar .sidebar-content h1, .sidebar .sidebar-content h2, .sidebar .sidebar-content h3, .sidebar .sidebar-content h4, .sidebar .sidebar-content h5, .sidebar .sidebar-content h6 {
-        color: white;
+
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #171310 0%, #0f0c0a 100%);
+        border-right: 1px solid rgba(216, 191, 143, 0.25);
     }
-    .sidebar .sidebar-content .stRadio > label {
-        color: white;
+
+    [data-testid="stSidebar"] * {
+        color: #f4ede3;
+        font-family: 'Manrope', sans-serif;
     }
-    .sidebar .sidebar-content .stRadio > div > div {
-        background-color: #e74c3c;
+
+    .stRadio > div {
+        gap: 0.5rem;
+    }
+
+    .stRadio > div > label {
+        background: rgba(216, 191, 143, 0.07);
+        border: 1px solid rgba(216, 191, 143, 0.24);
         border-radius: 10px;
-        padding: 10px;
-        margin-bottom: 10px;
-        transition: background-color 0.3s ease;
+        padding: 10px 12px;
+        transition: all 0.25s ease;
     }
-    .sidebar .sidebar-content .stRadio > div > div:hover {
-        background-color: #c0392b;
+
+    .stRadio > div > label:hover {
+        background: rgba(216, 191, 143, 0.20);
+        transform: translateX(4px);
     }
-    .sidebar .sidebar-content .stRadio > div > div:checked {
-        background-color: #e74c3c;
-        color: white;
-    }
-    .stButton>button {
-        background-color: #e74c3c;
-        color: white;
-        padding: 12px 28px;
+
+    .stButton>button, .stDownloadButton>button {
+        background: linear-gradient(90deg, #8e6f3b, var(--brand-2));
+        color: #1a130b;
+        padding: 10px 20px;
         border: none;
-        border-radius: 8px;
+        border-radius: 999px;
         cursor: pointer;
-        font-family: 'Garamond', serif;
-        transition: background-color 0.3s ease;
+        font-family: 'Manrope', sans-serif;
+        font-weight: 700;
+        transition: transform 0.25s ease, box-shadow 0.25s ease, filter 0.25s ease;
+        box-shadow: 0 10px 24px rgba(176, 138, 74, 0.34);
     }
-    .stButton>button:hover {
-        background-color: #ffffff;
+
+    .stButton>button:hover, .stDownloadButton>button:hover {
+        transform: translateY(-2px);
+        filter: brightness(1.05);
     }
+
     .heading {
-        font-size: 3em;
-        color: #e74c3c;
-        font-family: 'Garamond', serif;
-        font-weight: bold;
-        text-shadow: 3px 3px 8px rgba(0, 0, 0, 0.2);
+        font-size: clamp(2.1rem, 6vw, 3.8rem);
+        color: var(--ink);
+        font-family: 'Playfair Display', serif;
+        font-weight: 700;
+        letter-spacing: 0.03em;
         text-align: center;
+        margin-top: 0.3rem;
+        margin-bottom: 0.6rem;
+        animation: fadeSlide 0.75s ease both;
     }
+
+    .subheading {
+        text-align: center;
+        color: var(--muted);
+        font-size: 1.02rem;
+        margin-bottom: 1.2rem;
+    }
+
+    @keyframes fadeSlide {
+        from { transform: translateY(8px); opacity: 0; }
+        to { transform: translateY(0); opacity: 1; }
+    }
+
+    .feature-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 12px;
+        margin: 1rem 0 1.6rem;
+    }
+
+    .feature-tile {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        backdrop-filter: blur(6px);
+        -webkit-backdrop-filter: blur(6px);
+        padding: 0.9rem;
+        animation: fadeSlide 0.7s ease both;
+        box-shadow: 0 8px 24px var(--shadow);
+    }
+
+    .feature-tile strong {
+        display: block;
+        margin-top: 0.3rem;
+        color: var(--ink);
+        font-family: 'Playfair Display', serif;
+        font-size: 1.2rem;
+    }
+
     .features-list {
-        font-family: 'Garamond', serif;
-        font-size: 1.3em;
+        font-family: 'Manrope', sans-serif;
+        font-size: 1.03rem;
         padding: 0;
     }
+
     .feature-item {
         display: block;
-        margin: 10px 0;
-        color: #ecf0f1;
+        margin: 8px 0;
+        color: var(--muted);
     }
+
     .highlight {
-        color: #2ecc71;
+        color: #d5b67a;
     }
+
     .highlight-blue {
-        color: #3498db;
+        color: #ecd8b5;
     }
+
     .btn-container {
-        margin-top: 40px;
+        margin-top: 24px;
         text-align: center;
     }
+
     .review-card {
-        background-color: #2c3e50;
-        border-radius: 15px;
-        padding: 20px;
-        margin: 20px 0;
-        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
-        transition: transform 0.3s ease, box-shadow 0.3s ease;
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 18px 18px 10px 18px;
+        margin: 14px 0;
+        box-shadow: 0 14px 34px var(--shadow);
+        transition: transform 0.28s ease, box-shadow 0.28s ease;
+        animation: fadeSlide 0.6s ease both;
     }
+
     .review-card:hover {
-        transform: translateY(-10px);
-        box-shadow: 0 8px 16px rgba(0, 0, 0, 0.4);
+        transform: translateY(-2px);
+        box-shadow: 0 18px 40px rgba(0, 0, 0, 0.56);
     }
+
     .review-heading {
         font-size: 1.6em;
-        color: #f39c12;
+        color: #f1dec1;
         font-weight: bold;
-        margin-bottom: 15px;
+        margin-bottom: 10px;
         text-align: center;
+        font-family: 'Playfair Display', serif;
     }
+
     .review-content {
-        font-size: 1.2em;
-        color: white;
+        font-size: 1.04rem;
+        color: var(--ink);
         margin-bottom: 10px;
     }
+
     .review-highlight-food {
-        color: limegreen;
+        color: #e6c992;
         font-weight: bold;
     }
+
     .review-highlight-service {
-        color: cyan;
+        color: var(--brand-2);
         font-weight: bold;
     }
+
     .rating-stars {
-        color: #f1c40f;
+        color: #e6c47e;
         font-size: 1.3em;
         margin-top: 5px;
         text-align: center;
     }
+
     .key {
         font-weight: bold;
-        color: #f39c12;
+        color: #f0d6a6;
     }
+
     .value {
-        color: #bdc3c7;
+        color: #d9cbb9;
     }
+
     .no-data {
-        color: #95a5a6;
+        color: #c0b3a5;
         font-style: italic;
     }
+
+    .section-panel {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+        box-shadow: 0 14px 34px var(--shadow);
+    }
+
+    .section-title {
+        font-family: 'Playfair Display', serif;
+        font-size: 2rem;
+        color: var(--ink);
+        text-align: center;
+        margin: 0.2rem 0 0.4rem;
+    }
+
+    [data-testid="stMetric"] {
+        background: rgba(255, 244, 227, 0.10);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 10px;
+    }
+
+    [data-testid="stMetricLabel"], [data-testid="stMetricValue"] {
+        color: #f4e7d2;
+    }
+
+    [data-testid="stDataFrame"] {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        overflow: hidden;
+        background: rgba(255, 255, 255, 0.03);
+    }
+
     footer {
         text-align: center;
-        margin-top: 50px;
-        color: #bdc3c7;
+        margin-top: 30px;
+        color: #d9cab5;
+        font-size: 0.92rem;
+    }
+
+    @media (max-width: 720px) {
+        .review-card {
+            padding: 14px 12px 8px 12px;
+        }
+        .features-list {
+            font-size: 0.95rem;
+        }
     }
     </style>
     """,
@@ -159,49 +400,47 @@ st.markdown(
 # Sidebar for navigation
 st.sidebar.title("Navigation")
 st.sidebar.markdown("Choose an option to explore:")
+st.sidebar.caption(f"Analysis engine: {get_analysis_status()}")
 
 # Sidebar options
 options = ["Splash Screen", "Dashboard", "Data Table", "Comparison Charts","Overall Summary"]
-# selection = st.sidebar.radio("Go to", options)
 if 'selection' not in st.session_state:
     st.session_state.selection = "Splash Screen"
-selection = st.sidebar.radio("Go to", options, index=options.index(st.session_state.selection))
+
+
+def go_to_dashboard():
+    st.session_state.selection = "Dashboard"
+
+
+selection = st.sidebar.radio("Go to", options, key='selection')
 
 # Splash Screen Section
 if selection == "Splash Screen":
     def splash_screen():
         st.markdown(
             """
-            <h1 class="heading">Welcome to State and Lake Chicago Tavern Reviews 👋</h1>
+            <h1 class="heading">State and Lake Review Observatory</h1>
+            <p class="subheading">A dynamic lens on food quality, service behavior, and customer sentiment.</p>
             """,
             unsafe_allow_html=True
         )
 
         st.markdown(
             """
-            <div class="features-list">
-                <span class="feature-item">🔍 <strong>Search and filter reviews</strong></span>
-                <span class="feature-item">🔆 Highlighted text for <span class="highlight">food quality</span> and <span class="highlight-blue">staff service</span></span>
-                <span class="feature-item">🧭 <strong>Easy navigation</strong></span>
+            <div class="feature-grid">
+                <div class="feature-tile">🔍 <strong>Precision Search</strong><span class="feature-item">Filter deeply through structured review fields.</span></div>
+                <div class="feature-tile">🍽️ <strong>Food vs Service</strong><span class="feature-item">Separate praise and pain points instantly.</span></div>
+                <div class="feature-tile">📈 <strong>Trend Radar</strong><span class="feature-item">Compare long-term rating movement by restaurant.</span></div>
             </div>
             """,
             unsafe_allow_html=True
         )
 
-        if st.button('Go to Dashboard'):
-            global selection
-            st.session_state.selection = "Dashboard"
-            st.rerun()
-            selection = "Dashboard"
+        st.button('Go to Dashboard', on_click=go_to_dashboard)
     splash_screen()
 
 elif selection == "Dashboard":
-    def highlight_text(text, color):
-        """Returns text styled with the specified color."""
-        return f"<span style='color:{color}; font-weight:bold'>{text}</span>"
-
     def extract_numeric_rating(rating_str):
-        import re
         match = re.search(r'\d+', str(rating_str))
         return int(match.group()) if match else 0
 
@@ -215,66 +454,53 @@ elif selection == "Dashboard":
             return str(data)
 
     def dashboard(reviews):
-        st.markdown("<h1 style='color: #ecf0f1; text-align:center; padding: 20px;'>State and Lake Restaurant Reviews</h1>", unsafe_allow_html=True)
+        st.markdown("<div class='section-panel'><h2 class='section-title'>Live Review Dashboard</h2></div>", unsafe_allow_html=True)
 
         search_query = st.text_input(
             'Search for reviews',
             placeholder='Enter keywords to search reviews...',
             help='Type keywords to filter reviews',
+            key='dashboard_search_query',
         )
 
+        search_index = get_background_result('review_search_index', get_review_search_index, reviews)
+
         filtered_reviews = [
-            review for review in reviews
-            if search_query.lower() in json.dumps(review).lower()
+            review for review, search_blob in zip(reviews, search_index)
+            if search_query.lower() in search_blob
         ] if search_query else reviews
 
         if not filtered_reviews:
             st.warning("No reviews match your search criteria.")
         else:
-            st.markdown(f"<p style='color: #ecf0f1;'>Displaying {len(filtered_reviews)} result(s) for query: <i>{search_query}</i></p>", unsafe_allow_html=True)
+            st.markdown(f"<p style='color: #d7c7b0;'>Displaying <b>{len(filtered_reviews)}</b> result(s) for query: <i>{search_query}</i></p>", unsafe_allow_html=True)
 
         for review in filtered_reviews:
-            st.markdown("<hr>", unsafe_allow_html=True)
-            # st.markdown("<hr>", unsafe_allow_html=True)
             with st.container():
-                # Semi-transparent background to contrast with gradient
-                # st.markdown(
-                #     """
-                #     <div style='background-color: rgba(0, 0, 0, 0.5); padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);'>
-                #     """,
-                #     unsafe_allow_html=True
-                # )
+                st.markdown("<div class='review-card'>", unsafe_allow_html=True)
                 review_name = review.get('name', 'Anonymous')
                 dining_time = review.get('dining_time', 'Unknown Date')
                 rating = extract_numeric_rating(review.get('rating', 0))
 
-                # Styling the name and dining time with white text for contrast
-                st.markdown(f"<h3 style='color: #2ecc71; text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.6);text-align:center;'>{review_name}</h3>", unsafe_allow_html=True)
-                st.markdown(f"<p style='color: #A3F5B2FF; text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.6);text-align:center;'>{dining_time}</p>", unsafe_allow_html=True)
+                st.markdown(f"<h3 class='review-heading'>{review_name}</h3>", unsafe_allow_html=True)
+                st.markdown(f"<p style='color: #d0bfaa; text-align:center; margin-bottom:4px;'>{dining_time}</p>", unsafe_allow_html=True)
 
-                # Star rating with a gold color for better contrast on gradient
                 stars = "★" * rating + "☆" * (5 - rating)
-                st.markdown(f"<p style='font-size:20px; color:#f39c12; text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.6);text-align:center;'>{stars}</p>", unsafe_allow_html=True)
+                st.markdown(f"<p class='rating-stars'>{stars}</p>", unsafe_allow_html=True)
 
-                # Food quality section
                 food_quality = review.get('food_quality', 'No food quality provided')
-                st.markdown("<h4 style='color:#e74c3c; padding: 5px; text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.6);'>Food Quality</h4>", unsafe_allow_html=True)
+                st.markdown("<h4 style='color:#f1d8ab; margin-bottom:4px;'>Food Quality</h4>", unsafe_allow_html=True)
                 st.markdown(format_nested_data(food_quality), unsafe_allow_html=True)
 
-                # Staff service section
                 staff_service = review.get('staff_service', 'No staff service provided')
-                st.markdown("<h4 style='color:#3498db; padding: 5px; text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.6);'>Staff Service</h4>", unsafe_allow_html=True)
+                st.markdown("<h4 style='color:#e6d4b0; margin-bottom:4px;'>Staff Service</h4>", unsafe_allow_html=True)
                 st.markdown(format_nested_data(staff_service), unsafe_allow_html=True)
 
-                # Other comments section
                 other_comments = review.get('comments', [])
                 if other_comments:
-                    st.markdown("<h4 style='color:#9b59b6; text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.6);'>Other Comments</h4>", unsafe_allow_html=True)
+                    st.markdown("<h4 style='color:#d9c09d; margin-bottom:4px;'>Other Comments</h4>", unsafe_allow_html=True)
                     st.markdown(format_nested_data(other_comments), unsafe_allow_html=True)
-                # else:
-                #     st.markdown("<p style='color:#7f8c8d; text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.6);'>No additional comments available.</p>", unsafe_allow_html=True)
 
-                st.markdown("</div>", unsafe_allow_html=True)
                 st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("<footer style='text-align:center; padding: 10px;'>Powered by <b>Streamlit</b> | Designed by Hamda Shahid</footer>", unsafe_allow_html=True)
@@ -283,13 +509,13 @@ elif selection == "Dashboard":
 
 # Data Table Section
 elif selection == "Data Table":
-    st.header("📊 Explore Data Table")
+    st.markdown("<div class='section-panel'><h2 class='section-title'>Data Explorer</h2></div>", unsafe_allow_html=True)
 
     # Load the data from the CSV files
     csv_file1 = 'state_and_lake_chicago_tavern_reviews.csv'
     csv_file2 = 'second_restaurant_reviews.csv'
-    df1 = pd.read_csv(csv_file1)
-    df2 = pd.read_csv(csv_file2)
+    df1 = load_reviews_csv(csv_file1)
+    df2 = load_reviews_csv(csv_file2)
 
     # Display the first data table
     st.subheader("State and Lake Chicago Tavern Reviews")
@@ -315,45 +541,24 @@ elif selection == "Data Table":
 # # Charts Section
 # Comparison Charts Section
 elif selection == "Comparison Charts":
+    # Precompute yearly series once and reuse across reruns
+    df1_yearly = get_background_result('state_yearly', get_yearly_rating_data, 'state_and_lake_chicago_tavern_reviews.csv')
+    df2_yearly = get_background_result('second_yearly', get_yearly_rating_data, 'second_restaurant_reviews.csv')
 
-    # Function to convert 'Date of Review' to datetime
-    def convert_date(date_str):
-        if 'days ago' in date_str:
-            days_ago = int(date_str.split()[1])
-            return datetime.now() - timedelta(days=days_ago)
-        elif 'Dined on' in date_str:
-            return pd.to_datetime(date_str.replace('Dined on ', ''), format='%B %d, %Y')
-        else:
-            return pd.to_datetime(date_str, format="%Y-%m-%d")
-
-    # Load dataframes from CSV files
-    df = pd.read_csv('state_and_lake_chicago_tavern_reviews.csv')
-    df2 = pd.read_csv('second_restaurant_reviews.csv')
-
-    # Convert 'Date of Review' to datetime format
-    review_dates_1 = df["Date of Review"].apply(convert_date)
-    review_dates_2 = df2["Date of Review"].apply(convert_date)
-
-    # Convert 'Rating' to numeric values
-    ratings_1 = df["Rating"].apply(lambda x: int(x.split()[0]))
-    ratings_2 = df2["Rating"].apply(lambda x: int(x.split()[0]))
-
-    # Create new DataFrames with converted dates and ratings
-    df1_resampled = pd.DataFrame({'Date': review_dates_1, 'Rating': ratings_1})
-    df2_resampled = pd.DataFrame({'Date': review_dates_2, 'Rating': ratings_2})
-
-    # Resample data to yearly frequency and calculate the mean rating for each year
-    df1_yearly = df1_resampled.resample('YE', on='Date').mean()
-    df2_yearly = df2_resampled.resample('YE', on='Date').mean()
+    # Compute safe slider bounds from both datasets
+    year_min = int(min(df1_yearly.index.year.min(), df2_yearly.index.year.min()))
+    year_max = int(max(df1_yearly.index.year.max(), df2_yearly.index.year.max()))
+    default_start = max(year_min, year_max - 10)
 
     # Define custom year ranges and dynamic filters
     st.sidebar.header("Filter Data")
     min_year, max_year = st.sidebar.slider(
         "Select Year Range:", 
-        min_value=int(df1_yearly.index.year.min()),
-        max_value=int(df2_yearly.index.year.max()),
-        value=(2010, 2024),
-        step=1
+        min_value=year_min,
+        max_value=year_max,
+        value=(default_start, year_max),
+        step=1,
+        key='comparison_year_range'
     )
 
     # Filter data based on user-selected year range
@@ -374,11 +579,12 @@ elif selection == "Comparison Charts":
         title='Rating Trends for State and Lake Chicago Tavern',
         xaxis_title='Year',
         yaxis_title='Average Rating',
-        xaxis=dict(showgrid=True, tickangle=45),
-        yaxis=dict(showgrid=True),
-        template='plotly_white',
+        xaxis=dict(showgrid=True, tickangle=45, gridcolor='rgba(216,191,143,0.18)', color='#efe1cd'),
+        yaxis=dict(showgrid=True, gridcolor='rgba(216,191,143,0.18)', color='#efe1cd'),
+        template='plotly_dark',
         font=dict(size=14),
-        plot_bgcolor='#F9F9F9',
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(22,18,15,0.7)',
         title_font=dict(size=18)
     )
     st.plotly_chart(fig1, use_container_width=True)
@@ -397,11 +603,12 @@ elif selection == "Comparison Charts":
         title='Rating Trends for Heirloom - New Haven',
         xaxis_title='Year',
         yaxis_title='Average Rating',
-        xaxis=dict(showgrid=True, tickangle=45),
-        yaxis=dict(showgrid=True),
-        template='plotly_white',
+        xaxis=dict(showgrid=True, tickangle=45, gridcolor='rgba(216,191,143,0.18)', color='#efe1cd'),
+        yaxis=dict(showgrid=True, gridcolor='rgba(216,191,143,0.18)', color='#efe1cd'),
+        template='plotly_dark',
         font=dict(size=14),
-        plot_bgcolor='#F9F9F9',
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(22,18,15,0.7)',
         title_font=dict(size=18)
     )
     st.plotly_chart(fig2, use_container_width=True)
@@ -429,47 +636,46 @@ elif selection == "Comparison Charts":
     ))
 
     # Highlight peak ratings with annotations
-    max_rating_1 = df1_yearly['Rating'].max()
-    max_rating_2 = df2_yearly['Rating'].max()
-    peak_year_1 = df1_yearly['Rating'].idxmax()
-    peak_year_2 = df2_yearly['Rating'].idxmax()
+    if not df1_yearly.empty:
+        max_rating_1 = df1_yearly['Rating'].max()
+        peak_year_1 = df1_yearly['Rating'].idxmax()
+        fig.add_annotation(
+            x=peak_year_1,
+            y=max_rating_1,
+            text=f"Peak: {max_rating_1:.1f}",
+            showarrow=True,
+            arrowhead=1,
+            arrowcolor="black",
+            bgcolor="blue",
+            font=dict(color="white")
+        )
 
-    fig.add_annotation(
-        x=peak_year_1, 
-        y=max_rating_1,
-        text=f"Peak: {max_rating_1:.1f}",
-        showarrow=True,
-        arrowhead=1,
-        # bgcolor="yellow"
-        # color="black"
-        # arrowcolor="black"
-        arrowcolor="black",
-        bgcolor="blue",
-        font=dict(color="white")
-    )
-
-    fig.add_annotation(
-        x=peak_year_2, 
-        y=max_rating_2,
-        text=f"Peak: {max_rating_2:.1f}",
-        showarrow=True,
-        arrowhead=1,
-        arrowcolor="black",
-        bgcolor="red",
-        font=dict(color="white")
-    )
+    if not df2_yearly.empty:
+        max_rating_2 = df2_yearly['Rating'].max()
+        peak_year_2 = df2_yearly['Rating'].idxmax()
+        fig.add_annotation(
+            x=peak_year_2,
+            y=max_rating_2,
+            text=f"Peak: {max_rating_2:.1f}",
+            showarrow=True,
+            arrowhead=1,
+            arrowcolor="black",
+            bgcolor="red",
+            font=dict(color="white")
+        )
 
     # Update layout for better visual appeal
     fig.update_layout(
         title='Rating Comparison Trends for State and Lake Restaurant and Heirloom - New Haven Restaurant',
         xaxis_title='Year',
         yaxis_title='Average Rating',
-        xaxis=dict(showgrid=True, tickangle=45),
-        yaxis=dict(showgrid=True),
+        xaxis=dict(showgrid=True, tickangle=45, gridcolor='rgba(216,191,143,0.18)', color='#efe1cd'),
+        yaxis=dict(showgrid=True, gridcolor='rgba(216,191,143,0.18)', color='#efe1cd'),
         legend_title='Restaurant',
-        template='plotly_white',
+        template='plotly_dark',
         font=dict(size=14),
-        plot_bgcolor='#F9F9F9',
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(22,18,15,0.7)',
         title_font=dict(size=18),
         hovermode='x unified'
     )
@@ -479,30 +685,11 @@ elif selection == "Comparison Charts":
 
 elif selection == "Overall Summary":
     # Overall Summary Section
-    st.header("📋 Overall Review Summary")
+    st.markdown("<div class='section-panel'><h2 class='section-title'>Overall Review Summary</h2></div>", unsafe_allow_html=True)
     
-    # Load Data
-    df = pd.read_csv('state_and_lake_chicago_tavern_reviews.csv')
-    df2 = pd.read_csv('second_restaurant_reviews.csv')
-    
-    # Function to compute review summary
-    def overall_review_summary(df, restaurant_name):
-        avg_rating = df['Rating'].apply(lambda x: int(x.split()[0])).mean()
-        total_reviews = len(df)
-        positive_reviews = df[df['Rating'].str.contains('5 stars')].shape[0]
-        negative_reviews = df[df['Rating'].str.contains('1 star')].shape[0]
-        
-        return {
-            "restaurant_name": restaurant_name,
-            "avg_rating": avg_rating,
-            "total_reviews": total_reviews,
-            "positive_reviews": positive_reviews,
-            "negative_reviews": negative_reviews
-        }
-
     # Summarize reviews for both restaurants
-    summary1 = overall_review_summary(df, "State and Lake Chicago Tavern")
-    summary2 = overall_review_summary(df2, "Heirloom - New Haven")
+    summary1 = get_background_result('state_summary', overall_review_summary, 'state_and_lake_chicago_tavern_reviews.csv', "State and Lake Chicago Tavern")
+    summary2 = get_background_result('second_summary', overall_review_summary, 'second_restaurant_reviews.csv', "Heirloom - New Haven")
 
     # Define a helper function to display styled metrics
     def display_summary(summary):
